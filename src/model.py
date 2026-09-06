@@ -3,17 +3,33 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import average_precision_score, precision_recall_fscore_support
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    precision_recall_fscore_support,
+)
 from sklearn.model_selection import GroupKFold
 
 sys.path.insert(0, str(Path(__file__).parent))
 from dataset import GREEN, SAFETY_CAR, build_modelling_set, load_raw  # noqa: E402
 
-
+# Absolute lap and sector times encode circuit identity: Australia's median lap
+# (82.7s) sits below China's fastest (97.8s), so lap-time splits learned in
+# training fire on the wrong side of the distribution when a circuit is held
+# out. Replaced with circuit-invariant pace deltas computed in dataset.py.
 FEATURES = [
-    "LapNumber", "TyreLife", "Position",
-    "PaceVsRaceMedian", "PaceVsDriverBaseline", "PaceTrend3",
+    "LapNumber",
+    "Stint",
+    "TyreLife",
+    "Position",
+    "PaceVsRaceMedian",
+    "PaceVsDriverBaseline",
+    "PaceTrend3",
+    "IsSoft",
+    "IsMedium",
+    "IsHard",
     "IsSafetyCar",
 ]
 
@@ -25,6 +41,11 @@ RF_PARAMS = dict(n_estimators=300, max_depth=8,
 THRESHOLD_GRID = np.arange(0.05, 0.95, 0.01)
 
 OOF_PATH = Path("data/oof_predictions.csv")
+CALIB_PATH = Path("docs/calibration.png")
+
+# Isotonic needs more data than we have per fold; sigmoid is the safer choice
+# on ~3,700 training rows with ~400 positives.
+CALIBRATION_METHOD = "sigmoid"
 
 DISPLAY_COLS = [
     "Season", "Event", "Driver", "Team", "LapNumber", "Stint", "TyreLife",
@@ -71,9 +92,8 @@ def pick_threshold(model, X, y, groups):
     probs = np.zeros(len(y))
     inner = GroupKFold(n_splits=min(4, groups.nunique()))
     for tr, va in inner.split(X, y, groups):
-        m = RandomForestClassifier(**RF_PARAMS).fit(X.iloc[tr], y.iloc[tr])
+        m = fit_calibrated(X.iloc[tr], y.iloc[tr], groups.iloc[tr])
         probs[va] = m.predict_proba(X.iloc[va])[:, 1]
-
     best_t, best_f1 = 0.5, -1.0
     for t in THRESHOLD_GRID:
         _, _, f1, _ = precision_recall_fscore_support(
@@ -103,6 +123,53 @@ def baselines(y_true, X_test):
             y_true, X_test["TyreLife"])
     )
     return out
+
+
+def fit_calibrated(X, y, groups):
+    """Random Forest with probabilities calibrated on held-out races.
+
+    CalibratedClassifierCV's default cv would split rows at random, which is
+    the leak this project spent its evaluation design avoiding. Passing an
+    explicit GroupKFold keeps whole races on one side of the calibration split.
+    """
+    inner = GroupKFold(n_splits=min(4, groups.nunique()))
+    model = CalibratedClassifierCV(
+        RandomForestClassifier(**RF_PARAMS),
+        method=CALIBRATION_METHOD,
+        cv=list(inner.split(X, y, groups)),
+    )
+    return model.fit(X, y)
+
+
+def write_calibration_plot(frames):
+    """Reliability curve: does a predicted 0.7 mean 0.7?"""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed; skipping calibration plot")
+        return
+
+    oof = pd.concat(frames, ignore_index=True)
+    oof = oof[oof["PitProbability"].notna()]
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot([0, 1], [0, 1], "--", color="#888", label="perfect")
+    frac, mean_pred = calibration_curve(
+        oof["ActualPitInNext3"], oof["PitProbability"], n_bins=10, strategy="quantile"
+    )
+    ax.plot(mean_pred, frac, "o-", color="#4c78a8", label="out-of-fold")
+    ax.set_xlabel("predicted probability")
+    ax.set_ylabel("observed pit rate")
+    ax.set_title("Reliability, pooled across held-out races")
+    ax.legend()
+    fig.tight_layout()
+
+    CALIB_PATH.parent.mkdir(exist_ok=True)
+    fig.savefig(CALIB_PATH, dpi=140)
+    plt.close(fig)
+    print(f"wrote {CALIB_PATH}")
 
 
 def write_oof(frames, raw):
@@ -145,7 +212,7 @@ def run():
         Xtr, ytr, Xte, yte = X.iloc[tr], y.iloc[tr], X.iloc[te], y.iloc[te]
 
         t = pick_threshold(None, Xtr, ytr, groups.iloc[tr])
-        model = RandomForestClassifier(**RF_PARAMS).fit(Xtr, ytr)
+        model = fit_calibrated(Xtr, ytr, groups.iloc[tr])
         probs = model.predict_proba(Xte)[:, 1]
         preds = (probs >= t).astype(int)
 
@@ -157,6 +224,7 @@ def run():
             precision=p, recall=r, f1=f1, pr_auc=average_precision_score(
                 yte, probs),
             accuracy=(preds == yte).mean(),
+            brier=brier_score_loss(yte, probs),
         )
 
         ctx = df["TargetContext"].iloc[te]
@@ -180,7 +248,7 @@ def run():
     print(res.to_string(index=False, float_format=lambda v: f"{v:.3f}"), "\n")
 
     print("across held-out races (mean +/- std):")
-    for m in ("precision", "recall", "f1", "pr_auc", "accuracy"):
+    for m in ("precision", "recall", "f1", "pr_auc", "brier", "accuracy"):
         print(f"  {m:10s} {res[m].mean():.3f} +/- {res[m].std():.3f}")
     for m in ("recall_green", "recall_sc"):
         if m in res:
@@ -191,6 +259,7 @@ def run():
         print(f"  {name:16s} " +
               "  ".join(f"{k}={v:.3f}" for k, v in vals.items()))
 
+    write_calibration_plot(oof_frames)
     write_oof(oof_frames, raw)
 
 

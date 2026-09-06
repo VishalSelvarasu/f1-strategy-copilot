@@ -1,45 +1,81 @@
 # F1 Strategy Copilot
 
+![tests](https://github.com/VishalSelvarasu/f1-strategy-copilot/actions/workflows/tests.yml/badge.svg)
+
 Estimates the probability that a Formula 1 driver pits within the next three laps, using only information available at the end of the current lap.
 
 This is a **behavioural prediction model**, not a strategy optimiser. It learns what teams historically do given a race state. It does not compute what they should do — that would need counterfactual race simulation, a tyre degradation model, pit-loss estimates and an explicit race-outcome objective. None of those are here.
 
 ![Bahrain 2024, Hamilton](docs/dashboard.png)
 
-Both of Hamilton's stops in Bahrain are anticipated: probability climbs past 0.8 in the laps before lap 12, drops to near zero once he is on fresh tyres, then rebuilds through the second stint before the lap-33 stop. The dashed line is the operating threshold for that fold.
+Both of Hamilton's stops in Bahrain are anticipated: probability climbs in the laps before lap 12, drops to near zero once he is on fresh tyres, then rebuilds through the second stint before the lap-33 stop. The dashed line is the operating threshold for that fold.
 
 ---
 
 ## Results
 
-Five 2024 races, leave-one-race-out cross-validation. Every number below comes from a model that never saw the race it scored.
+Five 2024 races, leave-one-race-out cross-validation. Every number below comes from a model that never saw the race it scored. Probabilities are calibrated on held-out races within each training fold.
 
-| Held-out race | Laps | Positives | Threshold | Precision | Recall | F1 | PR-AUC |
-|---|---|---|---|---|---|---|---|
-| Bahrain | 1046 | 123 | 0.38 | 0.309 | 0.976 | 0.470 | 0.365 |
-| Chinese GP | 928 | 117 | 0.41 | 0.396 | 0.487 | 0.437 | 0.427 |
-| Australian GP | 921 | 107 | 0.49 | 0.324 | 0.626 | 0.427 | 0.365 |
-| Japanese GP | 803 | 103 | 0.47 | 0.316 | 0.699 | 0.435 | 0.442 |
-| Saudi Arabian GP | 815 | 57 | 0.53 | 0.088 | 0.298 | 0.136 | 0.088 |
-| **Mean ± std** | | | | **0.287 ± 0.116** | **0.617 ± 0.252** | **0.381 ± 0.138** | **0.337 ± 0.144** |
+| Held-out race | Laps | Positives | Threshold | Precision | Recall | F1 | PR-AUC | Brier |
+|---|---|---|---|---|---|---|---|---|
+| Bahrain | 1046 | 123 | 0.15 | 0.399 | 0.878 | 0.548 | 0.367 | 0.084 |
+| Chinese GP | 928 | 117 | 0.23 | 0.359 | 0.436 | 0.394 | 0.322 | 0.099 |
+| Australian GP | 921 | 107 | 0.10 | 0.327 | 0.813 | 0.466 | 0.378 | 0.084 |
+| Japanese GP | 803 | 103 | 0.13 | 0.433 | 0.592 | 0.500 | 0.431 | 0.100 |
+| Saudi Arabian GP | 815 | 57 | 0.27 | 0.095 | 0.246 | 0.137 | 0.102 | 0.090 |
+| **Mean ± std** | | | | **0.322 ± 0.133** | **0.593 ± 0.262** | **0.409 ± 0.162** | **0.320 ± 0.128** | **0.091 ± 0.008** |
 
-Excluding Saudi Arabia, which contains almost no green-flag strategy content, the remaining four folds give **PR-AUC 0.400 ± 0.038**.
+Excluding Saudi Arabia, which contains almost no green-flag strategy content, the remaining four folds give **PR-AUC 0.375 ± 0.045**.
 
 | | PR-AUC |
 |---|---|
 | Base rate (always predict no pit) | 0.112 |
 | Tyre life > 80th percentile | 0.120 |
-| **Random Forest, 7 features** | **0.337** |
+| **Random Forest, 7 features, calibrated** | **0.320** |
 
-Tyre age alone is worth almost nothing over the base rate. The model earns its complexity at roughly 3× lift on unseen circuits, but it is not a strong model.
+Tyre age alone is worth almost nothing over the base rate. The model earns its complexity at roughly 2.9× lift on unseen circuits, but it is not a strong model.
 
-**Mean accuracy is 0.778. Always predicting "no pit" scores 0.888.** The model is less accurate than the trivial baseline while being considerably more useful. Accuracy appears nowhere else in this document.
+**Mean accuracy is 0.815. Always predicting "no pit" scores 0.888.** The model is less accurate than the trivial baseline while being considerably more useful. Accuracy appears nowhere else in this document.
+
+---
+
+## Calibration
+
+A model that outputs 0.4 should be right about 40% of the time at that score, or the number is decoration. Random Forest probabilities are not calibrated by default — averaging over trees pulls them toward the middle, and `class_weight="balanced"` pushes them back out unevenly.
+
+Each fold now fits a `CalibratedClassifierCV` (Platt scaling) around the forest. The calibration split is an explicit `GroupKFold` on the training fold's races, not the default random split, which would fit the calibrator on laps from the same race it later scores — the exact leak this project's evaluation design exists to avoid.
+
+![Reliability curve](docs/calibration.png)
+
+Two things the curve says, and neither is what I expected:
+
+**The model is under-confident through the middle of its range.** At a predicted 0.24 the observed pit rate is 0.37; at 0.14 it is 0.19. The curve sits above the diagonal, so when this model says a window is unlikely-but-possible, it is understating the case. Only the top bin at 0.46 predicted / 0.30 observed falls below the line, and that bin holds few laps.
+
+**It never expresses high confidence.** No predicted probability exceeds about 0.46. There is no such thing as a 0.9 pit call here. With a base rate of 11% and no race-context features, the model has no basis for one.
+
+**Brier score is 0.091 ± 0.008.** That spread is by far the tightest of any metric in this project — recall varies by ±0.262 and PR-AUC by ±0.128 across the same folds. Calibration quality transfers between circuits even where discrimination does not.
+
+### What calibration cost
+
+| | Uncalibrated | Calibrated |
+|---|---|---|
+| Precision | 0.287 ± 0.116 | **0.322 ± 0.133** |
+| Recall | 0.617 ± 0.252 | 0.593 ± 0.262 |
+| F1 | 0.381 ± 0.138 | **0.409 ± 0.162** |
+| PR-AUC | **0.337 ± 0.144** | 0.320 ± 0.128 |
+| Brier | — | 0.091 ± 0.008 |
+
+Better decisions at the operating point, worse ranking. Four of five folds lost PR-AUC, China most of all at 0.427 → 0.322. The sigmoid fit consumes training data, and on ~3,700 rows with ~400 positives that is expensive.
+
+Whether this is a good trade depends on what the tool is for. A decision-support display where an engineer reads a number and needs it to mean something wants calibration. A ranking tool that surfaces the top *n* candidate laps does not, and would keep the uncalibrated model. This repo keeps calibration because the dashboard shows probabilities to a reader.
+
+Platt scaling rather than isotonic: isotonic is more flexible but needs considerably more data than is available per fold and overfits badly at this scale.
 
 ---
 
 ## Two corrections that cost most of the original performance
 
-An earlier version reported 0.91 accuracy, 0.56 precision and 0.72 recall. Both numbers were inflated, for reasons that are independent of each other.
+An earlier version reported 0.91 accuracy, 0.56 precision and 0.72 recall. Both numbers were inflated, for reasons independent of each other.
 
 ### The label included the current lap
 
@@ -58,7 +94,7 @@ A pit-in lap carries the pit entry inside its own lap time. Measured against eac
 
 The corrected label covers *t+1* through *t+3*, and pit-in laps are dropped from the modelling set. Labels are computed on lap numbers rather than row offsets, because the raw pipeline drops rows for missing timing data and row *i+1* is not always lap *n+1*.
 
-The +5.4s median is not separable on its own, so the lap-time delta is not the evidence. The evidence is downstream: precision falls from a reported 0.56 to a measured 0.287.
+The +5.4s median is not separable on its own, so the lap-time delta is not the evidence. The evidence is downstream: precision falls from a reported 0.56 to a measured 0.322.
 
 ### The split was random across laps
 
@@ -90,6 +126,8 @@ The four absolute timing features (`LapTimeSeconds` and three sector times) were
 | `PaceVsDriverBaseline` | lap time − that driver's median lap in that race |
 | `PaceTrend3` | change in 3-lap rolling mean pace |
 
+Measured before calibration was added, so both columns are uncalibrated:
+
 | | Absolute timing | Normalised pace |
 |---|---|---|
 | Precision | 0.219 ± 0.100 | 0.330 ± 0.121 |
@@ -114,9 +152,7 @@ Permutation importance on held-out races, scored by average precision, 10 repeat
 | `PaceTrend3` | 0.022 | −0.003 | −0.012 | 0.073 | −0.001 | 0.016 |
 | `IsSafetyCar` | 0.000 | 0.000 | 0.001 | 0.000 | 0.001 | 0.000 |
 
-An earlier eleven-feature version also carried `Stint`, `IsSoft`, `IsMedium` and `IsHard`. On the Bahrain fold those scored **−0.050, −0.036, 0.000 and −0.072** — permuting them *improved* held-out PR-AUC. They encode compound and stint patterns specific to a circuit's tyre allocation, which do not transfer. Dropping them raised PR-AUC from 0.324 to 0.337.
-
-The trade-off is real and visible in the charts. Precision fell from 0.325 to 0.287 and selected thresholds rose to 0.34–0.53, so the model now clears its own decision line by a narrower margin. More non-window laps sit near the true positives. PR-AUC is the metric that survives a change of operating point, so seven features is the version kept, but the separation is thinner than the eleven-feature model's.
+An earlier eleven-feature version also carried `Stint`, `IsSoft`, `IsMedium` and `IsHard`. On the Bahrain fold those scored **−0.050, −0.036, 0.000 and −0.072** — permuting them *improved* held-out PR-AUC. They encode compound and stint patterns specific to a circuit's tyre allocation, which do not transfer. Dropping them raised uncalibrated PR-AUC from 0.324 to 0.337.
 
 `IsSafetyCar` contributes nothing on any fold. It is a per-lap flag, and by the time a safety car is deployed the decision has effectively been made — the feature arrives too late. It is retained to document that.
 
@@ -144,19 +180,19 @@ Safety-car events are identified by FastF1 track status combined with a same-lap
 
 ![China 2024 — a green stop and a safety-car stop in one race](docs/context-china.png)
 
-China shows the difference in a single chart. Hamilton's lap-9 stop is a green-flag call and the model peaks near 0.75 going into it. His lap-21 stop is under the safety car and the model sits near 0.10 — nothing in the race state up to lap 20 pointed at it, because the trigger was the neutralisation itself.
+China shows the difference in a single chart. Hamilton's lap-9 stop is a green-flag call and the model climbs into it. His lap-21 stop is under the safety car and the model sits near zero — nothing in the race state up to lap 20 pointed at it, because the trigger was the neutralisation itself.
 
-That gap is consistent across the set: **recall 0.674 ± 0.209 on green-flag stops, 0.520 ± 0.390 on safety-car stops.**
+That gap is consistent across the set: **recall 0.630 ± 0.300 on green-flag stops, 0.426 ± 0.348 on safety-car stops.**
 
 ![Saudi Arabia 2024 — mostly safety-car stops](docs/limitation-saudi.png)
 
-**Saudi Arabia is the extreme case and explains the worst fold.** Its PR-AUC of 0.088 sits at its own base rate of 0.070, because 14 of its 20 pit events happened on a single lap under the safety car. Six green-flag strategy calls remain across 815 laps. The model is not failing there; there is very little strategic content to predict. The dashboard raises this warning by itself whenever safety-car stops outnumber green-flag ones.
+**Saudi Arabia is the extreme case and explains the worst fold.** Its PR-AUC of 0.102 sits near its own base rate of 0.070, because 14 of its 20 pit events happened on a single lap under the safety car. Six green-flag strategy calls remain across 815 laps. The model is not failing there; there is very little strategic content to predict. The dashboard raises this warning by itself whenever safety-car stops outnumber green-flag ones.
 
 ---
 
 ## Reproducing this on other races and drivers
 
-Everything below runs from the committed dataset except step 1, which needs network access to FastF1.
+Everything below runs from the committed dataset except the first step, which needs network access to FastF1.
 
 ### Change which races are in the dataset
 
@@ -180,7 +216,7 @@ python src/data_pipeline.py
 
 This overwrites `data/race_data.csv`. It downloads each race in turn and caches to `~/.fastf1`, so a second run is fast. Expect FastF1 warnings about incomplete data on some sessions; they do not stop dataset generation.
 
-**Minimum three races.** The outer `GroupKFold` uses one fold per event, and the inner threshold-selection CV needs at least two training events to work with.
+**Minimum three races.** The outer `GroupKFold` uses one fold per event, and the inner threshold-selection and calibration splits each need at least two training events.
 
 ### Change the prediction horizon
 
@@ -196,7 +232,9 @@ This overwrites `data/race_data.csv`. It downloads each race in turn and caches 
 python src/model.py
 ```
 
-Prints the per-race table, the mean ± std block and the baselines, then writes `data/oof_predictions.csv` for the dashboard. Runtime is a few minutes: five outer folds, each fitting four inner forests for threshold selection plus one final model.
+Prints the per-race table, the mean ± std block and the baselines, then writes `data/oof_predictions.csv` for the dashboard and `docs/calibration.png`.
+
+Runtime is around ten minutes. Five outer folds; each fits four inner calibrated models for threshold selection plus one final calibrated model, and each calibrated model is itself four forests. Roughly 100 forest fits in total.
 
 ### Look at any driver in any race
 
@@ -208,11 +246,21 @@ Race and driver are selectable in the sidebar. Every probability shown is out-of
 
 `data/oof_predictions.csv` is committed so the app runs immediately after cloning. It goes stale if you change the model without re-running it.
 
+### Run the tests
+
+```bash
+pytest tests/ -q
+```
+
+Nineteen tests, most of them on the label definition. `test_label_excludes_current_lap` asserts that a pit on lap 10 marks laps 7, 8 and 9 and explicitly not 10. `test_labels_do_not_cross_races` builds two races where only the second has an early pit and asserts the first has zero positives. `test_label_survives_missing_laps` deletes a lap from inside a window and asserts the label does not slide. All three pin bugs that were present in earlier versions of this code.
+
 ### Things that will bite you
 
 **Wet races break the compound encoding.** `IsSoft`/`IsMedium`/`IsHard` map INTERMEDIATE and WET to `0,0,0`, indistinguishable from missing. Those features are not in the current model, but if you reinstate them, add `IsIntermediate` and `IsWet` first.
 
 **`PaceTrend3` discards the first two laps of every driver's race.** For drivers who retire early this can remove them from the evaluation entirely. Verstappen has one scored lap in Australia 2024 for exactly this reason.
+
+**Threshold selection and calibration must operate on the same probability scale.** Picking a threshold from uncalibrated forests and applying it to calibrated output makes one fold predict nothing at all — Platt scaling compresses scores toward the base rate, so a threshold of 0.38 sits above almost every calibrated probability. Both now use `fit_calibrated`.
 
 **The safety-car clustering rule assumes a roughly twenty-car field.** `NEUTRALISATION_CLUSTER = 6` in `dataset.py`. Change it if you use a different series or a heavily attrited race.
 
@@ -230,13 +278,11 @@ I do not have an explanation. It is round 1 of the season, so early-season strat
 
 ## Limitations
 
-- **Five races is not enough.** Five folds cannot separate a real improvement from fold noise, and most of the ±0.144 PR-AUC spread is one structurally unusual race.
+- **Five races is not enough.** Five folds cannot separate a real improvement from fold noise, and most of the ±0.128 PR-AUC spread is one structurally unusual race.
 - **Green-flag-only evaluation is not possible at this sample size.** Isolating it would leave Saudi Arabia with 18 positive rows.
-- **Probabilities are not calibrated.** A predicted 0.5 does not mean half such laps see a pit. Calibration is the obvious next step and has not been done.
 - **No race context features.** Gap to cars ahead and behind, competitor tyre age, undercut threat and pit-loss estimates are all absent, and all matter more to a real strategy call than anything currently in the model.
 - **The safety-car clustering rule is unvalidated** against official FIA race control messages. It agrees with the known neutralisations in these five races and has not been tested further.
 - **Only one model family was tried.** No logistic regression, no gradient boosting, no hyperparameter search beyond the values recorded in `RF_PARAMS`.
-- **No unit tests.** The label horizon and the cross-race grouping are the two places a silent regression would do most damage and both are currently unguarded.
 
 ---
 
@@ -244,9 +290,10 @@ I do not have an explanation. It is round 1 of the season, so early-season strat
 
 ```
 src/data_pipeline.py   FastF1 acquisition and raw feature extraction
-src/dataset.py         Label definition, pit-context classification, row filtering
-src/model.py           Race-level cross-validation, evaluation, out-of-fold dump
+src/dataset.py         Label definition, pace features, pit-context classification
+src/model.py           Race-level CV, calibration, evaluation, out-of-fold dump
 app/streamlit_app.py   Dashboard over out-of-fold predictions
+tests/test_dataset.py  Label horizon, grouping and schema tests
 data/race_data.csv     Committed — model.py runs without a FastF1 download
 data/oof_predictions.csv
 ```
@@ -263,7 +310,7 @@ python -m streamlit run app/streamlit_app.py
 
 Python 3.12. Dependency versions in `requirements.txt` are pinned to what was actually tested — pandas 3.x changes `groupby().apply()` behaviour that `dataset.py` relies on.
 
-Stack: FastF1, pandas, scikit-learn, Streamlit, Altair.
+Stack: FastF1, pandas, scikit-learn, Streamlit, Altair, matplotlib.
 
 ---
 
