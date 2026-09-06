@@ -10,18 +10,11 @@ from sklearn.model_selection import GroupKFold
 sys.path.insert(0, str(Path(__file__).parent))
 from dataset import GREEN, SAFETY_CAR, build_modelling_set, load_raw  # noqa: E402
 
+
 FEATURES = [
-    "LapNumber",
-    "Stint",
-    "TyreLife",
-    "Position",
-    "IsSoft",
-    "IsMedium",
-    "IsHard",
+    "LapNumber", "TyreLife", "Position",
+    "PaceVsRaceMedian", "PaceVsDriverBaseline", "PaceTrend3",
     "IsSafetyCar",
-    "PaceVsRaceMedian",
-    "PaceVsDriverBaseline",
-    "PaceTrend3",
 ]
 
 TARGET = "PitInNext3Laps"
@@ -30,7 +23,14 @@ GROUP = "Event"
 RF_PARAMS = dict(n_estimators=300, max_depth=8,
                  random_state=42, class_weight="balanced")
 THRESHOLD_GRID = np.arange(0.05, 0.95, 0.01)
-PRECISION_FLOOR = 0.40
+
+OOF_PATH = Path("data/oof_predictions.csv")
+
+DISPLAY_COLS = [
+    "Season", "Event", "Driver", "Team", "LapNumber", "Stint", "TyreLife",
+    "Position", "Compound", "LapTimeSeconds", "PaceVsRaceMedian",
+    "PaceVsDriverBaseline", "PaceTrend3", "IsSafetyCar", "TargetContext",
+]
 
 
 def prepare(df):
@@ -105,6 +105,30 @@ def baselines(y_true, X_test):
     return out
 
 
+def write_oof(frames, raw):
+    """Out-of-fold predictions: every lap scored by a model that never saw its race.
+
+    In-laps are absent from the modelling set, so actual stop laps are joined
+    back from the raw frame for display. Those rows carry no prediction.
+    """
+    oof = pd.concat(frames, ignore_index=True)
+
+    pits = raw.loc[raw["WillPitThisLap"] == 1,
+                   ["Season", "Event", "Driver", "LapNumber", "PitContext"]].copy()
+    pits = pits.rename(columns={"PitContext": "ActualPitContext"})
+    pits["ActualPitLap"] = 1
+
+    oof = oof.merge(pits, on=["Season", "Event",
+                    "Driver", "LapNumber"], how="outer")
+    oof["ActualPitLap"] = oof["ActualPitLap"].fillna(0).astype(int)
+
+    OOF_PATH.parent.mkdir(exist_ok=True)
+    oof.sort_values(["Event", "Driver", "LapNumber"]
+                    ).to_csv(OOF_PATH, index=False)
+    print(f"\nwrote {OOF_PATH}: {len(oof)} rows, "
+          f"{int(oof['ActualPitLap'].sum())} actual stops marked")
+
+
 def run():
     raw = load_raw()
     from dataset import classify_pit_context
@@ -114,7 +138,7 @@ def run():
     df["TargetContext"] = target_context(df, raw)
 
     X, y, groups = df[FEATURES], df[TARGET], df[GROUP]
-    folds, rows = GroupKFold(n_splits=groups.nunique()), []
+    folds, rows, oof_frames = GroupKFold(n_splits=groups.nunique()), [], []
 
     for tr, te in folds.split(X, y, groups):
         held = groups.iloc[te].iloc[0]
@@ -142,6 +166,14 @@ def run():
                 rec[f"recall_{name}"] = (
                     preds[mask.values][yte[mask].values == 1].mean()
                 )
+        fold_out = df.iloc[te][[
+            c for c in DISPLAY_COLS if c in df.columns]].copy()
+        fold_out["ActualPitInNext3"] = yte.values
+        fold_out["PitProbability"] = probs
+        fold_out["PitPredicted"] = preds
+        fold_out["Threshold"] = t
+        oof_frames.append(fold_out)
+
         rows.append(rec)
 
     res = pd.DataFrame(rows)
@@ -158,6 +190,8 @@ def run():
     for name, vals in baselines(y, X).items():
         print(f"  {name:16s} " +
               "  ".join(f"{k}={v:.3f}" for k, v in vals.items()))
+
+    write_oof(oof_frames, raw)
 
 
 if __name__ == "__main__":
