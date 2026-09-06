@@ -8,6 +8,15 @@ cache_dir.mkdir(exist_ok=True)
 fastf1.Cache.enable_cache(cache_dir)
 
 
+RACES = [
+    (2024, "Bahrain", "R"),
+    (2024, "Saudi Arabian Grand Prix", "R"),
+    (2024, "Australian Grand Prix", "R"),
+    (2024, "Japanese Grand Prix", "R"),
+    (2024, "Chinese Grand Prix", "R"),
+]
+
+
 def add_next_pit_label(df, window=3):
     df = df.sort_values(["Driver", "LapNumber"]).reset_index(drop=True)
 
@@ -45,6 +54,7 @@ def add_engineered_features(df):
 
 
 def download_race(season, event, session_code="R"):
+    print(f"\nLoading {season} - {event} - {session_code}")
     session = fastf1.get_session(season, event, session_code)
     session.load()
 
@@ -70,24 +80,41 @@ def download_race(season, event, session_code="R"):
     ]
 
     df = laps[cols].copy()
+    df["Season"] = season
+    df["Event"] = event
+
     df = add_next_pit_label(df, window=3)
     df = add_engineered_features(df)
 
     return df
 
 
+def build_dataset(races):
+    all_races = []
+
+    for season, event, session_code in races:
+        try:
+            race_df = download_race(season, event, session_code)
+            all_races.append(race_df)
+            print(f"Added {event}: {len(race_df)} rows")
+        except Exception as e:
+            print(f"Failed for {event}: {e}")
+
+    final_df = pd.concat(all_races, ignore_index=True)
+    return final_df
+
+
 if __name__ == "__main__":
-    df = download_race(2024, "Bahrain", "R")
     Path("data").mkdir(exist_ok=True)
+
+    df = build_dataset(RACES)
     df.to_csv("data/race_data.csv", index=False)
 
-    print(df[[
-        "LapNumber", "Driver", "Compound", "Stint",
-        "PitInTime", "WillPitThisLap", "NextPitIn3Laps",
-        "LapTimeSeconds", "TyreLife", "Position"
-    ]].head(20))
-
+    print("\nDataset shape:", df.shape)
     print("\nLabel counts:")
     print(df[["WillPitThisLap", "NextPitIn3Laps"]].sum())
+
+    print("\nRaces included:")
+    print(df["Event"].value_counts())
 
     print("\nSaved to data/race_data.csv")
